@@ -1,83 +1,58 @@
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include "chacha20.h"
 #include <string.h>
 
-#define CHACHA20_BLOCK_SIZE 64
+static const uint32_t CONSTANTS[4] = {
+    0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 
+};
 
-typedef struct {
-    uint32_t state[16];
-} ChaCha20;
-
-// Rotates a 32-bit integer left by 'n' bits
-#define ROTL32(v, n) ((v << n) | (v >> (32 - n)))
-
-// Quarter round function
-#define QR(a, b, c, d) \
-    a += b; d ^= a; d = ROTL32(d, 16); 
-    c += d; b ^= c; b = ROTL32(b, 12); 
-    a += b; d ^= a; d = ROTL32(d, 8);  
-    c += d; b ^= c; b = ROTL32(b, 7);
-
-// Cipher function 
-static void chacha20_block(uint32_t out[16], const uint32_t in[16]) {
-    int i;
-    memcpy(out, in, 64);
-    for (i = 0; i < 10; i++) { // 20 rounds (10 iterations of column + diagonal rounds)
-        // Column rounds
-        QR(out[0], out[4], out[8], out[12]);
-        QR(out[1], out[5], out[9], out[13]);
-        QR(out[2], out[6], out[10], out[14]);
-        QR(out[3], out[7], out[11], out[15]);
-        // Diagonal rounds
-        QR(out[0], out[5], out[10], out[15]);
-        QR(out[1], out[6], out[11], out[12]);
-        QR(out[2], out[7], out[8], out[13]);
-        QR(out[3], out[4], out[9], out[14]);
-    }
-    for (i = 0; i < 16; i++) out[i] += in[i];
+static inline void quarter_round(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
+    *a += *b; *d ^= *a; *d = (*d << 16) | (*d >> 16);
+    *c += *d; *b ^= *c; *b = (*b << 12) | (*b >> 20);
+    *a += *b; *d ^= *a; *d = (*d << 8)  | (*d >> 24);
+    *c += *d; *b ^= *c; *b = (*b << 7)  | (*b >> 25);
 }
 
-void chacha20_init(ChaCha20 *ctx, const uint8_t key[32], const uint8_t nonce[12], uint32_t counter) {
-    static const char *constants = "expand 32-byte k";
-    ctx->state[0] = ((uint32_t *)constants)[0];
-    ctx->state[1] = ((uint32_t *)constants)[1];
-    ctx->state[2] = ((uint32_t *)constants)[2];
-    ctx->state[3] = ((uint32_t *)constants)[3];
-    memcpy(&ctx->state[4], key, 32);
+void chacha20_block(chacha20_ctx *ctx) {
+    uint32_t working_state[CHACHA20_STATE_WORDS];
+    memcpy(working_state, ctx->state, sizeof(working_state));
+
+    for (int i = 0; i < 10; i++) {
+
+        quarter_round(&working_state[0], &working_state[4], &working_state[8],  &working_state[12]);
+        quarter_round(&working_state[1], &working_state[5], &working_state[9],  &working_state[13]);
+        quarter_round(&working_state[2], &working_state[6], &working_state[10], &working_state[14]);
+        quarter_round(&working_state[3], &working_state[7], &working_state[11], &working_state[15]);
+
+        quarter_round(&working_state[0], &working_state[5], &working_state[10], &working_state[15]);
+        quarter_round(&working_state[1], &working_state[6], &working_state[11], &working_state[12]);
+        quarter_round(&working_state[2], &working_state[7], &working_state[8],  &working_state[13]);
+        quarter_round(&working_state[3], &working_state[4], &working_state[9],  &working_state[14]);
+    }
+
+    for (int i = 0; i < CHACHA20_STATE_WORDS; i++) {
+        working_state[i] += ctx->state[i];
+    }
+
+    memcpy(ctx->keystream, working_state, sizeof(ctx->keystream));
+    ctx->keystream_offset = 0;
+}
+
+void chacha20_init(chacha20_ctx *ctx, const uint8_t *key, const uint8_t *nonce, uint32_t counter) {
+    memcpy(ctx->state, CONSTANTS, sizeof(CONSTANTS));
+    memcpy(ctx->state + 4, key, CHACHA20_KEY_WORDS * sizeof(uint32_t));
     ctx->state[12] = counter;
-    memcpy(&ctx->state[13], nonce, 12);
+    memcpy(ctx->state + 13, nonce, CHACHA20_NONCE_WORDS * sizeof(uint32_t));
+    chacha20_block(ctx);
 }
 
-void chacha20_encrypt(ChaCha20 *ctx, uint8_t *data, size_t length) {
-    uint32_t block[16], keystream[16];
-    size_t i, j;
-    uint8_t *keystream_bytes = (uint8_t *)keystream;
-    
-    for (i = 0; i < length; i += CHACHA20_BLOCK_SIZE) {
-        memcpy(block, ctx->state, 64);
-        chacha20_block(keystream, block);
-        ctx->state[12]++; // Increment counter
-        for (j = 0; j < CHACHA20_BLOCK_SIZE && (i + j) < length; j++) {
-            data[i + j] ^= keystream_bytes[j];
+
+void chacha20_encrypt(chacha20_ctx *ctx, const uint8_t *input, uint8_t *output, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        if (ctx->keystream_offset >= 64) {
+            ctx->state[12]++; 
+            chacha20_block(ctx);
         }
-    }
-}
 
-int main() {
-    ChaCha20 ctx;
-    uint8_t key[32] = {0}; // Example key (all zeros)
-    uint8_t nonce[12] = {0}; // Example nonce (all zeros)
-    uint8_t plaintext[] = "Hello, ChaCha20!";
-    size_t len = strlen((char *)plaintext);
-    
-    chacha20_init(&ctx, key, nonce, 1);
-    chacha20_encrypt(&ctx, plaintext, len);
-    printf("Ciphertext: %s\n", plaintext);
-    
-    chacha20_init(&ctx, key, nonce, 1);
-    chacha20_encrypt(&ctx, plaintext, len);
-    printf("Decrypted: %s\n", plaintext);
-    
-    return 0;
+        output[i] = input[i] ^ ctx->keystream[ctx->keystream_offset++];
+    }
 }
